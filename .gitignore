@@ -1,0 +1,10 @@
+# This directory doubles as a `repo` workspace: kernel sources, prebuilts,
+# Bazel output, device images and release files all live next to the tooling.
+# Ignore everything and whitelist only what belongs to the project.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/build_ksun_susfs.sh
+!/scripts/
+__pycache__/
