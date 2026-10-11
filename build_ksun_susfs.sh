@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Pixel 8 (shiba) GKI kernel with KernelSU-Next + SUSFS for the stock firmware.
 #
-# Builds kernel/common at the exact tag the stock kernel was built from, adds
+# Builds kernel/common at the exact commit the stock kernel was built from, adds
 # KernelSU-Next (pershoot/dev-susfs) and SUSFS, and swaps the kernel inside the
 # stock boot.img. Vendor modules, dtbo, vendor_boot etc. stay stock.
 #
 # Commands (run from the directory this script lives in):
-#   detect   resolve the kernel/common tag from `uname -r` of the device
-#            (or KERNEL_RELEASE=...) and write target.env
+#   detect   resolve the kernel/common commit and its tag from `uname -r` of
+#            the device (or KERNEL_RELEASE=...) and write target.env
 #   sync     repo init + repo sync of the matching GKI manifest
 #   stock    dump boot/init_boot of the active slot (adb + root) into stock/,
 #            undoing a KernelSU LKM patch of init_boot
@@ -37,7 +37,8 @@ MAGISKBOOT="$ROOT/tools-host/magiskboot"
 KERNEL_OUT="$ROOT/bazel-bin/common/kernel_aarch64"
 
 KERNEL_RELEASE="${KERNEL_RELEASE:-}"
-TAG="${TAG:-}"
+COMMIT="${COMMIT:-}"
+DESCRIBE="${DESCRIBE:-}"
 MANIFEST_BRANCH="${MANIFEST_BRANCH:-}"
 BUILD_NUMBER="${BUILD_NUMBER:-}"
 
@@ -54,14 +55,14 @@ load_target() {
     local k v
     while IFS='=' read -r k v; do
         case "$k" in
-            KERNEL_RELEASE|TAG|MANIFEST_BRANCH|BUILD_NUMBER)
+            KERNEL_RELEASE|COMMIT|DESCRIBE|MANIFEST_BRANCH|BUILD_NUMBER)
                 [ -n "${!k}" ] || printf -v "$k" '%s' "$v" ;;
         esac
     done < "$TARGET_ENV"
 }
 
 require_target() {
-    [ -n "$TAG" ] && [ -n "$MANIFEST_BRANCH" ] && [ -n "$BUILD_NUMBER" ] ||
+    [ -n "$COMMIT" ] && [ -n "$DESCRIBE" ] && [ -n "$MANIFEST_BRANCH" ] && [ -n "$BUILD_NUMBER" ] ||
         die "target is unknown: run '$0 detect' first"
 }
 
@@ -80,12 +81,34 @@ detect() {
         die "unexpected kernel release '$krel' (want 6.1.x-android14-N-g<sha>-ab<build>)"
     local sha="${BASH_REMATCH[1]}" build="${BASH_REMATCH[2]}"
 
-    log "Looking up the kernel/common tag for g$sha"
-    local tag
-    tag="$(git ls-remote https://android.googlesource.com/kernel/common "refs/tags/${GKI_BRANCH}-*" |
-        awk -v s="$sha" 'index($1, s) == 1 { t = $2; sub("^refs/tags/", "", t); sub("\\^\\{\\}$", "", t); print t }' |
-        sort -uV | tail -n1)"
-    [ -n "$tag" ] || die "no ${GKI_BRANCH} tag points at $sha"
+    log "Looking up g$sha in kernel/common"
+    # The commit and its ancestors, newest first (Gitiles resolves the short sha)
+    local commits
+    commits="$(curl -fsSL "https://android.googlesource.com/kernel/common/+log/$sha?format=JSON&n=100" |
+        sed -n 's/^ *"commit": "\([0-9a-f]\{40\}\)",$/\1/p')" ||
+        die "g$sha is not in kernel/common: Google has not published this build yet"
+    [ -n "$commits" ] || die "cannot read the history of g$sha from Gitiles"
+
+    # "<sha> <tag>" lines; annotated tags also come peeled (<tag>^{})
+    local tags
+    tags="$(git ls-remote https://android.googlesource.com/kernel/common "refs/tags/${GKI_BRANCH}-*" |
+        awk '{ t = $2; sub("^refs/tags/", "", t); sub("\\^\\{\\}$", "", t); print $1, t }')"
+
+    # Pixel hotfix builds are cherry-picks on top of a tag and are not tagged
+    # themselves: take the nearest tagged ancestor, like `git describe --tags`.
+    local c tag="" dist=0
+    for c in $commits; do
+        tag="$(awk -v c="$c" '$1 == c { print $2 }' <<<"$tags" | sort -uV | tail -n1)"
+        [ -n "$tag" ] && break
+        dist=$((dist + 1))
+    done
+    [ -n "$tag" ] || die "no ${GKI_BRANCH} tag among the last 100 ancestors of $sha"
+
+    local commit="${commits%%$'\n'*}" describe="$tag"
+    if [ "$dist" -gt 0 ]; then
+        describe="$tag-$dist-g$sha"
+        warn "g$sha is not tagged: it is $dist commit(s) on top of $tag, building the commit itself"
+    fi
 
     local branch="common-${tag%_r*}"
     git ls-remote --exit-code --heads https://android.googlesource.com/kernel/manifest "$branch" >/dev/null ||
@@ -93,7 +116,8 @@ detect() {
 
     cat > "$TARGET_ENV" <<EOF
 KERNEL_RELEASE=$krel
-TAG=$tag
+COMMIT=$commit
+DESCRIBE=$describe
 MANIFEST_BRANCH=$branch
 BUILD_NUMBER=$build
 EOF
@@ -143,12 +167,13 @@ update_sources() {
     git -C "$SUSFS_DIR" log --oneline -1
 }
 
-checkout_tag() {
-    log "Checking out $TAG"
+checkout_commit() {
+    log "Checking out $DESCRIBE ($COMMIT)"
     cd "$COMMON"
     # Only the commit is needed. A deeper fetch on top of the shallow repo sync
-    # checkout makes the server send the whole history (gigabytes).
-    git fetch -q --depth=1 aosp "refs/tags/$TAG"
+    # checkout makes the server send the whole history (gigabytes). Fetching by
+    # sha also works for the untagged hotfix builds.
+    git fetch -q --depth=1 aosp "$COMMIT"
     git checkout -q --detach FETCH_HEAD
     # The stock kernel was built from the commit, not from a tag: without local
     # tags setlocalversion prints -android14-N-g<sha12>, exactly like stock.
@@ -208,7 +233,7 @@ prepare() {
     [ -e "$COMMON/.git" ] || die "no kernel sources: run '$0 sync' first"
     update_sources
     clean_common
-    checkout_tag
+    checkout_commit
     apply_susfs
     apply_ksu
     apply_config
@@ -307,7 +332,7 @@ repack() {
     (cd "$work" && "$MAGISKBOOT" repack boot.img boot-new.img)
 
     mkdir -p "$RELEASE"
-    local out="$RELEASE/boot-$TAG-ksun$(ksu_version)-susfs$(susfs_version).img"
+    local out="$RELEASE/boot-$DESCRIBE-ksun$(ksu_version)-susfs$(susfs_version).img"
     cp "$work/boot-new.img" "$out"
     rm -rf "$work"
     local images=("$out")
@@ -325,7 +350,7 @@ repack() {
 write_build_info() {
     {
         echo "Kernel release : $KERNEL_RELEASE"
-        echo "kernel/common  : $TAG ($(git -C "$COMMON" rev-parse --short=12 HEAD))"
+        echo "kernel/common  : $DESCRIBE ($(git -C "$COMMON" rev-parse --short=12 HEAD))"
         echo "KernelSU-Next  : $(ksu_version) (uapi $(ksu_uapi)), pershoot/dev-susfs $(git -C "$KSU_DIR" rev-parse --short=12 HEAD)," \
              "official dev $(git -C "$KSU_DIR" rev-parse --short=12 "$(ksu_base)")"
         echo "SUSFS          : $(susfs_version), susfs4ksu $(git -C "$SUSFS_DIR" rev-parse --short=12 HEAD)"

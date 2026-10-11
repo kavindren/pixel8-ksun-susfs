@@ -9,8 +9,9 @@ kernels made for Android 16 (Sultan-Kernel, for example) bootloop.
 
 ## What you get
 
-- The kernel is built from `kernel/common` at **the exact tag** Google built the
-  stock kernel of the firmware from. `uname -r` and `/proc/version` match stock
+- The kernel is built from `kernel/common` at **the exact commit** Google built
+  the stock kernel of the firmware from: usually a tag, sometimes an untagged
+  hotfix on top of one. `uname -r` and `/proc/version` match stock
   byte for byte. `.config` differs only by the `CONFIG_KSU*` options.
 - KernelSU-Next is built into the kernel (GKI mode, not LKM). The kernel side
   comes from [pershoot/KernelSU-Next](https://github.com/pershoot/KernelSU-Next)
@@ -66,14 +67,15 @@ flashing on them.
 git clone https://github.com/kavindren/pixel8-ksun-susfs
 cd pixel8-ksun-susfs
 
-./build_ksun_susfs.sh detect   # finds the kernel tag from the phone's `uname -r` -> target.env
+./build_ksun_susfs.sh detect   # finds the kernel commit from the phone's `uname -r` -> target.env
 ./build_ksun_susfs.sh stock    # dumps boot and init_boot of the active slot -> stock/
 ./build_ksun_susfs.sh all      # sync + prepare + build + repack + manager
 ./build_ksun_susfs.sh verify   # (recommended) checks stock module CRCs against the new kernel
 ```
 
 The results land in `release/`:
-- `boot-<tag>-ksun<version>-susfs<version>.img` — the kernel;
+- `boot-<tag>-ksun<version>-susfs<version>.img` — the kernel (for an untagged
+  hotfix `<tag>` is `git describe`-style, e.g. `android14-6.1-2026-03_r18-1-g9dd05ae3a1de`);
 - `init_boot-stock.img` — the stock init_boot;
 - `KernelSU_Next_*-spoofed_*.apk` — the manager;
 - `build-info.txt` — exact source commits and sha256 of the images.
@@ -95,7 +97,7 @@ firmware and put them into `stock/`.
 
 | Command | What it does |
 |---|---|
-| `detect` | reads `uname -r` (or `KERNEL_RELEASE`), finds the `kernel/common` tag and the manifest branch, writes `target.env` |
+| `detect` | reads `uname -r` (or `KERNEL_RELEASE`), finds the `kernel/common` commit, its nearest tag and the manifest branch, writes `target.env` |
 | `sync` | `repo init` + `repo sync` of the matching GKI manifest |
 | `stock` | dumps `boot`/`init_boot` over adb with root; if init_boot is patched by KernelSU LKM, restores the stock ramdisk |
 | `prepare` | resets `common/` to the tag, applies SUSFS, integrates KernelSU-Next, adjusts the config |
@@ -138,13 +140,19 @@ An OTA overwrites `boot`, and root is gone. To get the kernel back:
 2. Run `./build_ksun_susfs.sh detect && ./build_ksun_susfs.sh stock && ./build_ksun_susfs.sh all`.
 3. Flash the kernel as described above.
 
-If `detect` cannot find the tag, Google has not published the sources of that
-kernel build yet. They usually appear within a few days after the release.
+Monthly Pixel updates sometimes ship a hotfix kernel: a few cherry-picks on top
+of a `kernel/common` tag that never get a tag of their own. `detect` then warns
+`g<sha> is not tagged: it is N commit(s) on top of <tag>` and the kernel is built
+from that commit, with the toolchain of the tag's manifest branch.
+
+If `detect` says the commit is not in `kernel/common`, Google has not published
+the sources of that kernel build yet. They usually appear within a few days
+after the release.
 
 ## Why it is done this way
 
-- **A tag, not a branch.** Pixel vendor modules are built against one specific
-  kernel. At the exact tag the symbol CRCs are guaranteed to match (which is
+- **A commit, not a branch.** Pixel vendor modules are built against one specific
+  kernel. At the exact commit the symbol CRCs are guaranteed to match (which is
   what `verify` checks). The version string also comes out identical to stock:
   local tags are deleted from `common/`, the `-dirty` suffix is removed, and
   `BUILD_NUMBER` is taken from the stock `-ab<number>`.
